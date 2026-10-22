@@ -1,5 +1,6 @@
 package com.bishokudev.sheets;
 
+import org.apache.poi.openxml4j.util.ZipSecureFile;
 import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.ss.util.CellRangeAddress;
 import org.apache.poi.xssf.usermodel.*;
@@ -9,6 +10,46 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 public final class WorkbookIO {
+    static {
+        // Protect against decompression (ZIP bomb) attacks on untrusted XLSX uploads.
+        ZipSecureFile.setMinInflateRatio(0.01);
+        ZipSecureFile.setMaxEntrySize(64L * 1024 * 1024);
+        ZipSecureFile.setMaxTextSize(16L * 1024 * 1024);
+    }
+    // Stream every entry before POI builds an XML object graph. Limits apply to the
+    // complete archive, not just individual entries or declared ZIP sizes.
+    static void checkArchive(byte[] bytes) throws IOException {
+        long total=0;int entries=0;int[] xmlCounts=new int[4];Set<String> names=new HashSet<>();byte[] buffer=new byte[8192];
+        try(java.util.zip.ZipInputStream zip=new java.util.zip.ZipInputStream(new ByteArrayInputStream(bytes))){
+            java.util.zip.ZipEntry entry;
+            while((entry=zip.getNextEntry())!=null){
+                if(++entries>512||!names.add(entry.getName()))throw new IllegalArgumentException("Too many or duplicate ZIP entries");
+                long size=0;int n;ByteArrayOutputStream xml=new ByteArrayOutputStream();boolean isXml=entry.getName().endsWith(".xml")||entry.getName().endsWith(".rels");
+                while((n=zip.read(buffer))!=-1){size+=n;total+=n;if(size>8L*1024*1024||total>32L*1024*1024)throw new IllegalArgumentException("Expanded workbook exceeds safe limits");if(isXml)xml.write(buffer,0,n);}
+                if(isXml)checkXml(xml.toByteArray(),xmlCounts);
+                if(size>1024*1024&&entry.getCompressedSize()>0&&size>entry.getCompressedSize()*100L)throw new IllegalArgumentException("Unsafe workbook compression ratio");
+            }
+        }
+        if(entries==0)throw new IllegalArgumentException("Invalid XLSX archive");
+    }
+    private static void checkXml(byte[] xml,int[] counts) throws IOException {
+        javax.xml.stream.XMLInputFactory factory=javax.xml.stream.XMLInputFactory.newDefaultFactory();
+        factory.setProperty(javax.xml.stream.XMLInputFactory.SUPPORT_DTD,false);
+        factory.setProperty("javax.xml.stream.isSupportingExternalEntities",false);
+        try {
+            javax.xml.stream.XMLStreamReader reader=factory.createXMLStreamReader(new ByteArrayInputStream(xml));
+            try { while(reader.hasNext()) {
+                int event=reader.next();
+                if(event==javax.xml.stream.XMLStreamConstants.DTD)throw new IllegalArgumentException("DTD is not allowed in workbooks");
+                if(event!=javax.xml.stream.XMLStreamConstants.START_ELEMENT)continue;
+                if(++counts[0]>1_000_000)throw new IllegalArgumentException("Workbook XML is too complex");
+                String name=reader.getLocalName();
+                if(name.equals("c")&&++counts[1]>SheetEngine.MAX_CELLS)throw new IllegalArgumentException("Too many workbook cells");
+                if(name.equals("si")&&++counts[2]>SheetEngine.MAX_CELLS)throw new IllegalArgumentException("Too many shared strings");
+                if(name.equals("xf")&&++counts[3]>10000)throw new IllegalArgumentException("Too many workbook styles");
+            }} finally {reader.close();}
+        } catch(javax.xml.stream.XMLStreamException e){throw new IOException("Invalid workbook XML",e);}
+    }
     private static JSONObject document(int nr,int nc) {
         if(nr>SheetEngine.MAX_ROWS||nc>SheetEngine.MAX_COLS||(long)nr*nc>SheetEngine.MAX_CELLS) throw new IllegalArgumentException("Workbook exceeds sheet limits");
         JSONObject d=SheetEngine.empty();JSONArray rs=new JSONArray(),cs=new JSONArray();
@@ -17,6 +58,11 @@ public final class WorkbookIO {
         return d.put("rows",rs).put("columns",cs);
     }
     public static JSONObject read(byte[] bytes,String format) throws IOException {
+        return read(bytes,format,false);
+    }
+    public static JSONObject read(byte[] bytes,String format,boolean allowFormulas) throws IOException {
+        if(bytes==null||bytes.length>10_000_000)throw new IllegalArgumentException("Maximum upload size: 10 MB");
+        if("xlsx".equals(format))checkArchive(bytes);
         JSONArray sheets=new JSONArray(),warnings=new JSONArray();
         if("csv".equals(format)) {
             List<List<String>> records=parseCsv(new String(bytes,StandardCharsets.UTF_8).replaceFirst("^\\uFEFF",""));
@@ -40,10 +86,17 @@ public final class WorkbookIO {
                     d.put("columnWidths",widths).put("rowHeights",heights);
                     for(Row row:sheet)for(Cell cell:row) {
                         CellType type=cell.getCellType();
-                        if(type==CellType.FORMULA)throw new IllegalArgumentException("Formula at "+sheet.getSheetName()+"!"+cell.getAddress()+". Export a values-only workbook before importing.");
-                        if(type==CellType.ERROR)throw new IllegalArgumentException("Error cell at "+cell.getAddress());
                         JSONObject value=new JSONObject().put("type","text").put("value","");
-                        if(type==CellType.NUMERIC)value.put("type","number").put("value",Double.toString(cell.getNumericCellValue()));
+                        if(type==CellType.FORMULA) {
+                            if(!allowFormulas) throw new IllegalArgumentException("Formula at "+sheet.getSheetName()+"!"+cell.getAddress()+". Export a values-only workbook before importing.");
+                            value.put("formula","="+cell.getCellFormula());
+                            CellType cached=cell.getCachedFormulaResultType();
+                            if(cached==CellType.NUMERIC&&Double.isFinite(cell.getNumericCellValue()))value.put("type","number").put("value",Double.toString(cell.getNumericCellValue()));
+                            else if(cached==CellType.BOOLEAN)value.put("type","boolean").put("value",Boolean.toString(cell.getBooleanCellValue()));
+                            else if(cached==CellType.STRING)value.put("value",cell.getStringCellValue());
+                            else value.put("value","="+cell.getCellFormula());
+                        } else if(type==CellType.ERROR)throw new IllegalArgumentException("Error cell at "+cell.getAddress());
+                        else if(type==CellType.NUMERIC)value.put("type","number").put("value",Double.toString(cell.getNumericCellValue()));
                         else if(type==CellType.BOOLEAN)value.put("type","boolean").put("value",Boolean.toString(cell.getBooleanCellValue()));
                         else if(type==CellType.STRING)value.put("value",cell.getStringCellValue());
                         XSSFCellStyle style=(XSSFCellStyle)cell.getCellStyle();
@@ -59,6 +112,7 @@ public final class WorkbookIO {
                         put(d,row.getRowNum(),cell.getColumnIndex(),value);
                     }
                     for(CellRangeAddress m:sheet.getMergedRegions())d.getJSONArray("merges").put(new JSONObject().put("row",m.getFirstRow()).put("column",m.getFirstColumn()).put("height",m.getLastRow()-m.getFirstRow()+1).put("width",m.getLastColumn()-m.getFirstColumn()+1));
+                    SheetFormulas.recalculate(d);
                     SheetEngine.validate(d);
                     sheets.put(new JSONObject().put("name",sheet.getSheetName()).put("document",d));
                 }
@@ -73,6 +127,8 @@ public final class WorkbookIO {
     private static XSSFColor color(String s) {return new XSSFColor(new byte[]{(byte)Integer.parseInt(s.substring(1,3),16),(byte)Integer.parseInt(s.substring(3,5),16),(byte)Integer.parseInt(s.substring(5,7),16)},new DefaultIndexedColorMap());}
     private static void put(JSONObject d,int r,int c,JSONObject value) {d.getJSONObject("cells").put(d.getJSONArray("rows").getString(r)+":"+d.getJSONArray("columns").getString(c),value.put("version",1));}
     public static byte[] write(JSONObject d,boolean csv) throws IOException {
+        d=new JSONObject(d.toString());
+        SheetFormulas.recalculate(d);
         JSONArray rs=d.getJSONArray("rows"),cs=d.getJSONArray("columns");JSONObject cells=d.getJSONObject("cells");
         if(csv) {
             StringBuilder s=new StringBuilder("\uFEFF");
@@ -95,8 +151,15 @@ public final class WorkbookIO {
                 Row row=sheet.createRow(r);row.setHeightInPoints((heights==null?24:heights.optInt(rs.getString(r),24))*3f/4);
                 for(int c=0;c<cs.length();c++) {
                     JSONObject v=cells.optJSONObject(rs.getString(r)+":"+cs.getString(c));if(v==null)continue;
-                    Cell cell=row.createCell(c);String text=v.optString("value","");
-                    switch(v.optString("type","text")){case "number":cell.setCellValue(Double.parseDouble(text));break;case "boolean":cell.setCellValue(Boolean.parseBoolean(text));break;default:cell.setCellValue(text);}
+                    Cell cell=row.createCell(c);String text=v.optString("value",""),formula=v.optString("formula","");
+                    if(formula.startsWith("=")&&formula.length()>1){
+                        cell.setCellFormula(formula.substring(1));
+                        if("number".equals(v.optString("type")))cell.setCellValue(Double.parseDouble(text));
+                        else if("boolean".equals(v.optString("type")))cell.setCellValue(Boolean.parseBoolean(text));
+                        else cell.setCellValue(text);
+                    } else {
+                        switch(v.optString("type","text")){case "number":cell.setCellValue(Double.parseDouble(text));break;case "boolean":cell.setCellValue(Boolean.parseBoolean(text));break;default:cell.setCellValue(text);}
+                    }
                     String styleKey=v.optString("background")+"|"+v.optString("foreground")+"|"+v.optBoolean("bold")+"|"+v.optString("format")+"|"+v.optBoolean("italic")+"|"+v.optBoolean("underline")+"|"+v.optDouble("fontSize",11)+"|"+v.optBoolean("wrap")+"|"+v.optString("align");
                     XSSFCellStyle style=styles.get(styleKey);
                     if(style==null){

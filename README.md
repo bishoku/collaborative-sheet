@@ -44,18 +44,26 @@ Upgrade all cluster nodes together: mixed plugin versions and downgrades are uns
 
 | Area | Current behavior |
 | --- | --- |
-| Size | Up to 9,999 rows, 200 columns and 200,000 grid positions per sheet |
+| Size | Up to 9,999 rows, 200 columns, 200,000 grid positions, and 16 MB serialized document; whichever limit is reached first |
 | Batch editing | Up to 10,000 cells per operation; 100 displayed rows per page |
 | Import | Up to 10 MB; replaces the selected table after preview |
 | Merged cells | XLSX import/export supported; UI merge/unmerge and paste over merged ranges are not supported |
 | Sorting/filtering | Disabled for sheets containing merged ranges |
-| Formulas | No formula engine; formula/error cells are rejected on import |
+| Formulas | Server-calculated arithmetic, comparisons, A1/$A$1 references, SUM, AVERAGE, COUNT, MIN, MAX and IF; unsupported syntax/functions reject the operation |
 | Excel fidelity | Basic styles and merges; not charts, images, themes or full workbook fidelity |
 | Number formats | Retained for XLSX export; grid displays raw values, including Excel date serials |
-| Structure | Append rows/columns; no deletion or insertion in the middle |
-| Page lifecycle | Copy/move/trash workflows are not fully handled; copying a page does not copy AO data |
+| Structure | Insert/delete rows and columns; references and merged ranges shift with structure |
+| Page lifecycle | Page-copy listener copies AO sheets; trash and removal retain history. Automatic orphan deletion is disabled to avoid losing data if page removal rolls back |
 | Pending edits | Retried/downloadable while the page stays open; no durable offline queue |
-| Revision retention | No pruning or general revision-restore UI yet |
+| Revision retention | Pruning is disabled: checkpoints, undo links and retry receipts remain intact. Monitor database growth; no general revision-restore UI |
+
+Formula calculations are authoritative on the server. UI updates, change feeds and exports use those results. Limits are 2,000 formula cells, 10,000 positions per range, 512 tokens per expression, nesting depth 64 and one million evaluation steps per operation. This is a bounded subset, not full Excel compatibility. XLSX imports reject unsupported formulas rather than silently replacing their results.
+
+Pending edits are sent in order with immutable request IDs. A failed request retains the complete queue for retry or download; the queue is in memory and does not survive closing the tab. Do not close a page while it shows pending or failed saves. Text-formatted values and long numeric identifiers remain text.
+
+XLSX validation limits expanded data to 32 MiB total and 8 MiB per entry, 512 entries, one million XML elements and 10,000 styles before POI loads the workbook. Highly compressed files and DTDs are rejected. Valid files can also exceed these safety limits.
+
+Sheet values are added to Confluence search using its [Extractor2 integration](https://developer.atlassian.com/server/confluence/extractor2-module-tutorial/). Writes enqueue page reindexing; search results are eventually consistent. Existing sheets require a reindex or a subsequent edit after installing this version. Static export renders the full populated range without the previous 100-row/50-column truncation.
 
 ## Build and test
 
@@ -63,7 +71,7 @@ Requirements: JDK 17, Maven 3.9.x and Node.js 22 (for clipboard tests). Maven re
 
 ```sh
 mvn --batch-mode verify
-node --test scripts/clipboard.test.cjs
+node --test scripts/*.test.cjs
 ```
 
 The development JAR is `target/sheets-confluence-dc-0.1.0-SNAPSHOT.jar`. The Java suite currently contains 38 tests, including atomicity, conflict detection, request retries, rollback, permissions, workbook conversion and user-specific undo. Four clipboard parser tests cover rectangular and quoted multiline data.

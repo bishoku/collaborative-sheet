@@ -13,6 +13,10 @@ import java.util.concurrent.locks.Lock;
 
 public final class SheetStore {
     static final int CHECKPOINT_INTERVAL=32;
+    static final int RETENTION_REVISIONS=256;
+    public static final class BusyException extends RuntimeException {
+        public BusyException(String message) { super(message); }
+    }
     // Cached documents are immutable. Every read still obtains its committed head from the DB.
     // Maximum four documents, never authoritative and never published before commit.
     private static final Map<String,JSONObject> CACHE=new LinkedHashMap<String,JSONObject>(8,.75f,true){
@@ -23,6 +27,7 @@ public final class SheetStore {
     public SheetStore(ActiveObjects ao,ClusterLockService locks) { this.ao=ao; this.locks=locks; }
     static void clearCache(){synchronized(CACHE){CACHE.clear();}}
     private static void cache(String key,JSONObject d){synchronized(CACHE){JSONObject prior=CACHE.get(key);if(prior==null||prior.getInt("revision")<=d.getInt("revision")) CACHE.put(key,d);}}
+    public static void evictPrefix(String pagePrefix){synchronized(CACHE){CACHE.keySet().removeIf(k->k.startsWith(pagePrefix));}}
     private Revision[] latest(String key){return ao.find(Revision.class,Query.select().where("SHEET_KEY = ?",key).order("SEQUENCE DESC").limit(1));}
     public JSONObject read(String key) {Revision[] r=latest(key);return r.length==0?null:at(key,r[0].getSequence());}
     private JSONObject at(String key,int target) {
@@ -72,12 +77,58 @@ public final class SheetStore {
         if(rows.length!=1||!rows[0].getActor().equals(actor)||rows[0].getAction()==null)throw new SheetEngine.Conflict("History entry is unavailable for this user");
         return new JSONObject(rows[0].getAction());
     }
+    public int pruneRevisions(String key,int keepLatest){
+        // Retain checkpoints, inverse links and durable receipts together. Until a migration
+        // can preserve their contracts, pruning is deliberately disabled (including manual calls).
+        return 0;
+    }
+    public JSONObject copySheet(String sourceKey,String targetKey,String actor){
+        Lock lock=locks.getLockForName("com.bishokudev.sheets:"+targetKey);boolean acquired=false;
+        try {
+            acquired=lock.tryLock(15,TimeUnit.SECONDS);if(!acquired)throw new BusyException("Target sheet busy");
+            JSONObject committed=ao.executeInTransaction(()->{
+                if(latest(targetKey).length>0)return read(targetKey);
+                JSONObject src=read(sourceKey);if(src==null)return null;
+                JSONObject copy=new JSONObject(src.toString()).put("revision",1);
+                String reqId=UUID.randomUUID().toString();
+                ao.create(Revision.class,new DBParam("SHEET_KEY",targetKey),new DBParam("REVISION_KEY",targetKey+":1"),
+                    new DBParam("REQUEST_KEY",hash(targetKey+":"+actor+":"+reqId)),new DBParam("REQUEST_HASH",hash("copy:"+sourceKey)),
+                    new DBParam("SEQUENCE",1),new DBParam("DOCUMENT",copy.toString()),
+                    new DBParam("ACTION",new JSONObject().put("kind","copy").put("undoHead",0).put("redoHead",0).toString()),
+                    new DBParam("ACTOR",actor),new DBParam("CREATED_AT",System.currentTimeMillis()));
+                return copy;
+            });
+            if(committed!=null)cache(targetKey,committed);
+            return committed;
+        }catch(InterruptedException e){Thread.currentThread().interrupt();throw new BusyException("Interrupted");}
+        finally{if(acquired)lock.unlock();}
+    }
+    public int copyPageSheets(long sourcePageId,long targetPageId,String actor){
+        if(sourcePageId<=0||targetPageId<=0||sourcePageId==targetPageId)return 0;
+        String prefix=sourcePageId+":";
+        Revision[] rows=ao.find(Revision.class,Query.select().where("SHEET_KEY LIKE ?",prefix+"%").order("SEQUENCE DESC"));
+        Set<String> copied=new HashSet<>();
+        for(Revision r:rows){
+            String sk=r.getSheetKey();
+            if(sk.startsWith(prefix)&&copied.add(sk)){
+                String sheetName=sk.substring(prefix.length());
+                copySheet(sk,targetPageId+":"+sheetName,actor==null?"system":actor);
+            }
+        }
+        return copied.size();
+    }
+    public int deletePageSheets(long pageId){
+        if(pageId<=0)return 0;
+        String prefix=pageId+":";
+        evictPrefix(prefix);
+        return ao.deleteWithSQL(Revision.class,"SHEET_KEY LIKE ?",prefix+"%");
+    }
     public JSONObject write(String key,String actor,String requestId,JSONObject op,Runnable permissionCheck) {
         if(!requestId.matches("[a-zA-Z0-9-]{16,64}")) throw new IllegalArgumentException("Invalid request id");
         String requestKey=hash(key+":"+actor+":"+requestId), digest=hash(op.toString());
         Lock lock=locks.getLockForName("com.bishokudev.sheets:"+key);boolean acquired=false;
         try {
-            acquired=lock.tryLock(15,TimeUnit.SECONDS);if(!acquired)throw new IllegalStateException("Sheet busy; retry the same request");
+            acquired=lock.tryLock(15,TimeUnit.SECONDS);if(!acquired)throw new BusyException("Sheet busy; retry the same request");
             permissionCheck.run();
             JSONObject committed=ao.executeInTransaction(() -> {
                 Revision[] receipts=ao.find(Revision.class,Query.select().where("REQUEST_KEY = ?",requestKey));
@@ -100,17 +151,24 @@ public final class SheetStore {
                     if(entry!=null)action.put("entry",entry).put("undoNext",state.optInt("undoHead"));
                 }
                 JSONObject payload=after;
-                if(entry!=null&&entry.getString("type").equals("patch")&&after.getInt("revision")%CHECKPOINT_INTERVAL!=0){
-                    JSONObject cells=new JSONObject();for(Object value:entry.getJSONArray("cells")){String id=((JSONObject)value).getString("id");cells.put(id,after.getJSONObject("cells").get(id));}
-                    payload=new JSONObject().put("journalPatch",true).put("revision",after.getInt("revision")).put("cells",cells);
+                int rev=after.getInt("revision");
+                if(entry!=null&&entry.getString("type").equals("patch")&&rev%CHECKPOINT_INTERVAL!=0){
+                    JSONObject cells=new JSONObject();
+                    // Include derived formula results as well as the explicitly edited cells.
+                    for(String id:after.getJSONObject("cells").keySet()) {
+                        JSONObject cell=after.getJSONObject("cells").getJSONObject(id);
+                        JSONObject old=before.getJSONObject("cells").optJSONObject(id);
+                        if(old!=cell&&(old==null||!cell.similar(old)))cells.put(id,cell);
+                    }
+                    payload=new JSONObject().put("journalPatch",true).put("revision",rev).put("cells",cells);
                 }
-                ao.create(Revision.class,new DBParam("SHEET_KEY",key),new DBParam("REVISION_KEY",key+":"+after.getInt("revision")),new DBParam("REQUEST_KEY",requestKey),new DBParam("REQUEST_HASH",digest),new DBParam("SEQUENCE",after.getInt("revision")),new DBParam("DOCUMENT",payload.toString()),new DBParam("ACTION",action.toString()),new DBParam("ACTOR",actor),new DBParam("CREATED_AT",System.currentTimeMillis()));
+                ao.create(Revision.class,new DBParam("SHEET_KEY",key),new DBParam("REVISION_KEY",key+":"+rev),new DBParam("REQUEST_KEY",requestKey),new DBParam("REQUEST_HASH",digest),new DBParam("SEQUENCE",rev),new DBParam("DOCUMENT",payload.toString()),new DBParam("ACTION",action.toString()),new DBParam("ACTOR",actor),new DBParam("CREATED_AT",System.currentTimeMillis()));
                 faultProbe("before-commit",requestId);
                 return after;
             });
             faultProbe("after-commit",requestId);
             cache(key,committed);return committed;
-        }catch(InterruptedException e){Thread.currentThread().interrupt();throw new IllegalStateException("Interrupted; retry the same request",e);}
+        }catch(InterruptedException e){Thread.currentThread().interrupt();throw new BusyException("Interrupted; retry the same request");}
         finally{if(acquired)lock.unlock();}
     }
     // The probe class is absent from production artifacts. Only the isolated fault-test JAR supplies it.

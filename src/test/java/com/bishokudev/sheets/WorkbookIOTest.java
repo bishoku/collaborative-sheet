@@ -45,4 +45,33 @@ public class WorkbookIOTest {
         }
         JSONObject imported=WorkbookIO.read(bytes,"xlsx").getJSONArray("sheets").getJSONObject(0).getJSONObject("document");String nr=imported.getJSONArray("rows").getString(0),nc=imported.getJSONArray("columns").getString(0);assertEquals(64,imported.getJSONObject("rowHeights").getInt(nr));assertEquals(180,imported.getJSONObject("columnWidths").getInt(nc),2);assertEquals("Line one\nLine two",imported.getJSONObject("cells").getJSONObject(nr+":"+nc).getString("value"));
     }
+
+    @Test public void formulaRoundTripSupportedWhenAllowed() throws Exception {
+        byte[] input;
+        try(XSSFWorkbook b=new XSSFWorkbook();ByteArrayOutputStream out=new ByteArrayOutputStream()){
+            Sheet s=b.createSheet("Formulas");
+            s.createRow(0).createCell(0).setCellValue(10);
+            s.createRow(1).createCell(0).setCellValue(20);
+            Cell f=s.createRow(2).createCell(0);
+            f.setCellFormula("SUM(A1:A2)");
+            f.setCellValue(30);
+            b.write(out);input=out.toByteArray();
+        }
+        JSONObject doc=WorkbookIO.read(input,"xlsx",true).getJSONArray("sheets").getJSONObject(0).getJSONObject("document");
+        String r2=doc.getJSONArray("rows").getString(2),c0=doc.getJSONArray("columns").getString(0);
+        JSONObject cell=doc.getJSONObject("cells").getJSONObject(r2+":"+c0);
+        assertEquals("=SUM(A1:A2)",cell.getString("formula"));
+        assertEquals(30,Double.parseDouble(cell.getString("value")),0);
+        try(XSSFWorkbook exported=new XSSFWorkbook(new ByteArrayInputStream(WorkbookIO.write(doc,false)))){
+            assertEquals("SUM(A1:A2)",exported.getSheetAt(0).getRow(2).getCell(0).getCellFormula());
+        }
+    }
+
+    byte[] zip(String content) throws Exception {
+        ByteArrayOutputStream bytes=new ByteArrayOutputStream();
+        try(java.util.zip.ZipOutputStream z=new java.util.zip.ZipOutputStream(bytes)){z.putNextEntry(new java.util.zip.ZipEntry("xl/worksheets/sheet1.xml"));z.write(content.getBytes(StandardCharsets.UTF_8));z.closeEntry();}return bytes.toByteArray();
+    }
+    @Test(expected=IllegalArgumentException.class) public void zipBombRejectedBeforePoi() throws Exception {WorkbookIO.checkArchive(zip("x".repeat(9*1024*1024)));}
+    @Test(expected=IllegalArgumentException.class) public void xmlEntityExpansionRejectedBeforePoi() throws Exception {WorkbookIO.checkArchive(zip("<!DOCTYPE x [<!ENTITY a 'payload'>]><x>&a;</x>"));}
+    @Test(expected=IllegalArgumentException.class) public void excessiveStylesRejectedBeforePoi() throws Exception {WorkbookIO.checkArchive(zip("<styles>"+"<xf/>".repeat(10001)+"</styles>"));}
 }

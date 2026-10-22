@@ -25,6 +25,7 @@ public final class SheetEngine {
         d.put("cells",copiedCells);
         d.put("rows",new JSONArray(original.getJSONArray("rows").toList()));
         d.put("columns",new JSONArray(original.getJSONArray("columns").toList()));
+        d.put("merges",new JSONArray(original.optJSONArray("merges")==null?Collections.emptyList():original.getJSONArray("merges").toList()));
         String type = operation.getString("type");
         if (type.equals("patch")) {
             JSONArray edits = operation.getJSONArray("edits");
@@ -39,9 +40,9 @@ public final class SheetEngine {
                 JSONObject current=d.getJSONObject("cells").optJSONObject(key);
                 int version=current==null?0:current.optInt("version");
                 if(e.getInt("expectedVersion")!=version) throw new Conflict("Cell changed by another user: "+key);
-                JSONObject next=e.getJSONObject("cell");
+                JSONObject next=sanitizeCell(new JSONObject(e.getJSONObject("cell").toString()));
                 validateCell(next);
-                d.getJSONObject("cells").put(key,new JSONObject(next.toString()).put("version",version+1).put("changeId",id()));
+                d.getJSONObject("cells").put(key,next.put("version",version+1).put("changeId",id()));
             }
         } else {
             if(operation.getInt("expectedRevision")!=d.getInt("revision"))
@@ -52,7 +53,40 @@ public final class SheetEngine {
                 rekey(d);
             } else if(type.equals("addRow")) d.getJSONArray("rows").put(id());
             else if(type.equals("addColumn")) d.getJSONArray("columns").put(id());
-            else if(type.equals("resize")) {
+            else if(type.equals("insertRow")||type.equals("insertColumn")) {
+                boolean isRow=type.equals("insertRow");
+                JSONArray list=d.getJSONArray(isRow?"rows":"columns");
+                int idx=operation.optInt("index",list.length());
+                if(idx<0||idx>list.length()) throw new IllegalArgumentException("Invalid insert index");
+                List<Object> items=new ArrayList<>(list.toList());
+                items.add(idx,id());
+                d.put(isRow?"rows":"columns",new JSONArray(items));
+                shiftMerges(d,isRow,idx,1);
+                SheetFormulas.shift(d,isRow,idx,1);
+            } else if(type.equals("deleteRow")||type.equals("deleteColumn")) {
+                boolean isRow=type.equals("deleteRow");
+                JSONArray list=d.getJSONArray(isRow?"rows":"columns");
+                if(list.length()<=1) throw new IllegalArgumentException("Sheet must retain at least 1 "+(isRow?"row":"column"));
+                String targetId=operation.optString("id","");
+                int idx=-1;
+                if(!targetId.isEmpty()){for(int i=0;i<list.length();i++)if(list.getString(i).equals(targetId)){idx=i;break;}}
+                else if(operation.has("index")) idx=operation.getInt("index");
+                if(idx<0||idx>=list.length()) throw new Conflict("The "+(isRow?"row":"column")+" no longer exists");
+                String removedId=list.getString(idx);
+                List<Object> items=new ArrayList<>(list.toList());
+                items.remove(idx);
+                d.put(isRow?"rows":"columns",new JSONArray(items));
+                Iterator<String> cellKeys=d.getJSONObject("cells").keys();
+                while(cellKeys.hasNext()){
+                    String ck=cellKeys.next();String[] parts=ck.split(":",-1);
+                    if(parts[isRow?0:1].equals(removedId)) cellKeys.remove();
+                }
+                String sizeField=isRow?"rowHeights":"columnWidths";
+                if(d.has(sizeField)){JSONObject sz=new JSONObject(d.getJSONObject(sizeField).toString());sz.remove(removedId);d.put(sizeField,sz);}
+                if(d.has(sizeField+"Changes")){JSONObject st=new JSONObject(d.getJSONObject(sizeField+"Changes").toString());st.remove(removedId);d.put(sizeField+"Changes",st);}
+                shiftMerges(d,isRow,idx,-1);
+                SheetFormulas.shift(d,isRow,idx,-1);
+            } else if(type.equals("resize")) {
                 String axis=operation.getString("axis"), field=axis.equals("column")?"columnWidths":"rowHeights";
                 if(!axis.equals("column")&&!axis.equals("row"))throw new IllegalArgumentException("Invalid resize axis");
                 String identity=operation.getString("id");
@@ -63,11 +97,39 @@ public final class SheetEngine {
             }
             else throw new IllegalArgumentException("Unknown operation");
         }
+        SheetFormulas.recalculate(d);
         d.put("revision",original.getInt("revision")+1);
         if(type.equals("patch")) {
             if(d.toString().length()>16_000_000) throw new IllegalArgumentException("Sheet exceeds 16 MB document limit");
         } else validate(d);
         return d;
+    }
+    private static void shiftMerges(JSONObject d,boolean isRow,int index,int delta) {
+        JSONArray merges=d.optJSONArray("merges");
+        if(merges==null||merges.length()==0) return;
+        JSONArray updated=new JSONArray();
+        String posKey=isRow?"row":"column",spanKey=isRow?"height":"width";
+        for(int i=0;i<merges.length();i++){
+            JSONObject m=new JSONObject(merges.getJSONObject(i).toString());
+            int pos=m.getInt(posKey),span=m.getInt(spanKey);
+            if(delta>0){
+                if(pos>=index) m.put(posKey,pos+1);
+                else if(pos+span>index) m.put(spanKey,span+1);
+                updated.put(m);
+            } else {
+                if(pos>index){m.put(posKey,pos-1);updated.put(m);}
+                else if(pos<=index&&pos+span>index){
+                    if(span>1){m.put(spanKey,span-1);if(m.getInt("height")>1||m.getInt("width")>1)updated.put(m);}
+                } else updated.put(m);
+            }
+        }
+        d.put("merges",updated);
+    }
+    static JSONObject sanitizeCell(JSONObject c) {
+        for(String f:Arrays.asList("background","foreground","align","format","formula")) {
+            if(c.has(f)&&(c.isNull(f)||c.optString(f,"").isEmpty())) c.remove(f);
+        }
+        return c;
     }
     static void rekey(JSONObject d) {
         JSONArray oldR=d.getJSONArray("rows"), oldC=d.getJSONArray("columns"), rows=new JSONArray(), cols=new JSONArray();
@@ -89,6 +151,7 @@ public final class SheetEngine {
     static boolean contains(JSONArray a,String id) { for(int i=0;i<a.length();i++) if(a.getString(i).equals(id)) return true; return false; }
     static void validateCell(JSONObject c) {
         if(c.optString("value","").length()>32767) throw new IllegalArgumentException("Cell text exceeds Excel limit");
+        if(c.optString("formula","").length()>4096) throw new IllegalArgumentException("Formula exceeds limit");
         if(!Arrays.asList("text","number","boolean").contains(c.optString("type","text"))) throw new IllegalArgumentException("Invalid cell type");
         if(c.optString("type").equals("number")) {
             double n=Double.parseDouble(c.getString("value"));

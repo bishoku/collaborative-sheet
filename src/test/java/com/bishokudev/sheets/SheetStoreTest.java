@@ -31,9 +31,18 @@ public class SheetStoreTest {
                     catch(RuntimeException e){committed=previous;throw e;}
                 case "find":
                     Query q=(Query)args[1];String field=q.getWhereClause().split(" ")[0];
+                    if(q.getWhereClause().contains("SHEET_KEY LIKE ?")){
+                        String pfx=((String)q.getWhereParams()[0]).replace("%","");
+                        return committed.stream().filter(v->String.valueOf(v.get("SHEET_KEY")).startsWith(pfx)).sorted((a,b)->Integer.compare((Integer)b.get("SEQUENCE"),(Integer)a.get("SEQUENCE"))).map(this::proxy).toArray(Revision[]::new);
+                    }
                     return committed.stream().filter(v->Objects.equals(v.get(field),q.getWhereParams()[0]) && (q.getWhereParams().length<2 || (q.getWhereClause().contains("ACTOR = ?") ? Objects.equals(v.get("ACTOR"),q.getWhereParams()[1]) : (q.getWhereClause().contains("SEQUENCE > ?") ? (Integer)v.get("SEQUENCE")>(Integer)q.getWhereParams()[1] && (Integer)v.get("SEQUENCE")<=(Integer)q.getWhereParams()[2] : (Integer)v.get("SEQUENCE")<=(Integer)q.getWhereParams()[1])))).sorted((a,b)->"SEQUENCE ASC".equals(q.getOrderClause())?Integer.compare((Integer)a.get("SEQUENCE"),(Integer)b.get("SEQUENCE")):Integer.compare((Integer)b.get("SEQUENCE"),(Integer)a.get("SEQUENCE"))).limit(q.getLimit()>0?q.getLimit():Long.MAX_VALUE).map(this::proxy).toArray(Revision[]::new);
                 case "create":
                     assertTrue("Writes must hold shared lock",lock.isHeldByCurrentThread());Map<String,Object> values=new HashMap<>();for(DBParam v:(DBParam[])args[1])values.put(v.getField(),v.getValue());committed.add(values);return proxy(values);
+                case "deleteWithSQL":
+                    String where=(String)args[1];Object[] params=(Object[])args[2];int beforeSize=committed.size();
+                    if(where.contains("SEQUENCE <= ?"))committed.removeIf(v->Objects.equals(v.get("SHEET_KEY"),params[0])&&(Integer)v.get("SEQUENCE")<=(Integer)params[1]);
+                    else if(where.contains("SHEET_KEY LIKE ?")){String pfx=((String)params[0]).replace("%","");committed.removeIf(v->String.valueOf(v.get("SHEET_KEY")).startsWith(pfx));}
+                    return beforeSize-committed.size();
                 default:throw new UnsupportedOperationException(method.getName());
             }
         }
@@ -83,5 +92,29 @@ public class SheetStoreTest {
         s.write("1:sheet","u",UUID.randomUUID().toString(),patch(initial,0,"one",0),()->{});
         s.write("1:sheet","u",UUID.randomUUID().toString(),patch(initial,1,"two",0),()->{});
         h.committed.remove(1);SheetStore.clearCache();s.read("1:sheet");
+    }
+
+    @Test public void retentionPruningAndPageDeletionPreserveLatestAndCleanOrphans(){
+        Harness h=new Harness();SheetStore s=h.store();
+        JSONObject initial=s.write("99:sheet","u",UUID.randomUUID().toString(),new JSONObject().put("type","create"),()->{});
+        for(int i=0;i<96;i++) s.write("99:sheet","u",UUID.randomUUID().toString(),patch(initial,0,"v"+i,i),()->{});
+        int pruned=s.pruneRevisions("99:sheet",64);
+        assertEquals("Pruning must not remove receipts or inverse links",0,pruned);
+        SheetStore.clearCache();
+        JSONObject readBack=s.read("99:sheet");
+        assertEquals(97,readBack.getInt("revision"));
+        assertEquals("v95",readBack.getJSONObject("cells").getJSONObject(initial.getJSONArray("rows").getString(0)+":"+initial.getJSONArray("columns").getString(0)).getString("value"));
+        String html=SheetMacro.renderStaticHtml("sheet",readBack);
+        assertTrue(html.contains("<table"));
+        assertTrue(html.contains("v95"));
+        assertEquals(1,s.copyPageSheets(99L,100L,"admin"));
+        JSONObject copiedDoc=s.read("100:sheet");
+        assertNotNull(copiedDoc);
+        assertEquals(1,copiedDoc.getInt("revision"));
+        assertEquals("v95",copiedDoc.getJSONObject("cells").getJSONObject(initial.getJSONArray("rows").getString(0)+":"+initial.getJSONArray("columns").getString(0)).getString("value"));
+        int deleted=s.deletePageSheets(99L);
+        assertTrue(deleted>0);
+        assertNull(s.read("99:sheet"));
+        assertNotNull(s.read("100:sheet"));
     }
 }

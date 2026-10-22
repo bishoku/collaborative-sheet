@@ -13,13 +13,13 @@ public interface Revision extends Entity {
     void setRequestKey(String value);
     @NotNull String getRequestHash();
     void setRequestHash(String value);
-    @NotNull int getSequence();
+    @NotNull @Indexed int getSequence();
     void setSequence(int value);
     @NotNull @StringLength(StringLength.UNLIMITED) String getDocument();
     void setDocument(String value);
     @StringLength(StringLength.UNLIMITED) String getAction();
     void setAction(String value);
-    @NotNull String getActor();
+    @NotNull @Indexed String getActor();
     void setActor(String value);
     @NotNull long getCreatedAt();
     void setCreatedAt(long value);
